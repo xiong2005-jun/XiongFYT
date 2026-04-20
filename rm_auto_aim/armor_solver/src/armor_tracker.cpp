@@ -37,7 +37,7 @@ Tracker::Tracker(double max_match_distance, double max_match_yaw_diff)
 : tracker_state(LOST)
 , tracked_id(std::string(""))
 , measurement(Eigen::VectorXd::Zero(4))
-, target_state(Eigen::VectorXd::Zero(9))
+, target_state(Eigen::VectorXd::Zero(X_N))
 , max_match_distance_(max_match_distance)
 , max_match_yaw_diff_(max_match_yaw_diff)
 , detect_count_(0)
@@ -75,37 +75,38 @@ void Tracker::init(const Armors::SharedPtr &armors_msg) noexcept {
   }
 }
 
-void Tracker::update(const Armors::SharedPtr &armors_msg) noexcept {
-  // KF predict
+void Tracker::update(const Armors::SharedPtr &armors_msg, ObservationSource source) noexcept {
+  // EKF 预测
   Eigen::VectorXd ekf_prediction = ekf->predict();
 
   bool matched = false;
-  // Use KF prediction as default target state if no matched armor is found
   target_state = ekf_prediction;
 
+  // 根据来源调整匹配距离阈值
+  double match_distance_thresh = max_match_distance_;
+  if (source == ObservationSource::REAR) {
+    match_distance_thresh *= 1.5;  // 后相机放宽 50%
+  }
+
   if (!armors_msg->armors.empty()) {
-    // Find the closest armor with the same id
     Armor same_id_armor;
     int same_id_armors_count = 0;
     auto predicted_position = getArmorPositionFromState(ekf_prediction);
     double min_position_diff = DBL_MAX;
     double yaw_diff = DBL_MAX;
+
     for (const auto &armor : armors_msg->armors) {
-      // Only consider armors with the same id
       if (armor.number == tracked_id) {
         same_id_armor = armor;
         same_id_armors_count++;
-        // Calculate the difference between the predicted position and the
-        // current armor position
         auto p = armor.pose.position;
         Eigen::Vector3d position_vec(p.x, p.y, p.z);
         double position_diff = (predicted_position - position_vec).norm();
         if (position_diff < min_position_diff) {
-          // Find the closest armor
           min_position_diff = position_diff;
-          yaw_diff = abs(orientationToYaw(armor.pose.orientation) - ekf_prediction(6));
+          yaw_diff = std::abs(orientationToYaw(armor.pose.orientation) - ekf_prediction(6));
           tracked_armor = armor;
-          // Update tracked armor type
+          // 更新装甲板数量类型
           if (tracked_armor.type == "large" &&
               (tracked_id == "3" || tracked_id == "4" || tracked_id == "5")) {
             tracked_armors_num = ArmorsNum::BALANCE_2;
@@ -118,28 +119,20 @@ void Tracker::update(const Armors::SharedPtr &armors_msg) noexcept {
       }
     }
 
-    // Check if the distance and yaw difference of closest armor are within the
-    // threshold
-    if (min_position_diff < max_match_distance_ && yaw_diff < max_match_yaw_diff_) {
-      // Matched armor found
+    if (min_position_diff < match_distance_thresh && yaw_diff < max_match_yaw_diff_) {
       matched = true;
       auto p = tracked_armor.pose.position;
-      // Update EKF
       double measured_yaw = orientationToYaw(tracked_armor.pose.orientation);
       measurement = Eigen::Vector4d(p.x, p.y, p.z, measured_yaw);
       target_state = ekf->update(measurement);
     } else if (same_id_armors_count == 1 && yaw_diff > max_match_yaw_diff_) {
-      // Matched armor not found, but there is only one armor with the same id
-      // and yaw has jumped, take this case as the target is spinning and armor
-      // jumped
       handleArmorJump(same_id_armor);
     } else {
-      // No matched armor found
       FYT_WARN("armor_solver", "No matched armor found!");
     }
   }
 
-  // Prevent radius from spreading
+  // 半径限幅
   if (target_state(8) < 0.12) {
     target_state(8) = 0.12;
     ekf->setState(target_state);
@@ -148,7 +141,7 @@ void Tracker::update(const Armors::SharedPtr &armors_msg) noexcept {
     ekf->setState(target_state);
   }
 
-  // Tracking state machine
+  // 状态机
   if (tracker_state == DETECTING) {
     if (matched) {
       detect_count_++;

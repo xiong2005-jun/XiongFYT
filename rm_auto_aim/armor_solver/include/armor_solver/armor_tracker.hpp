@@ -38,6 +38,7 @@
 namespace fyt::auto_aim {
 
 enum class ArmorsNum { NORMAL_4 = 4, BALANCE_2 = 2, OUTPOST_3 = 3 };
+enum class ObservationSource { FRONT, REAR };
 
 class Tracker {
 public:
@@ -48,7 +49,8 @@ public:
 
   void init(const Armors::SharedPtr &armors_msg) noexcept;
 
-  void update(const Armors::SharedPtr &armors_msg) noexcept;
+    // 修改 update 签名
+  void update(const Armors::SharedPtr &armors_msg, ObservationSource source) noexcept;
 
   enum State {
     LOST,

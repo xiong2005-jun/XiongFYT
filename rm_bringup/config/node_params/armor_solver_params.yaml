@@ -16,6 +16,9 @@
       r_z: 9e-4
       r_yaw: 5e-3
 
+      front_r_scale: 1.0
+      rear_r_scale: 1.0
+
     tracker:
       max_match_distance: 0.5
       max_match_yaw_diff: 1.0

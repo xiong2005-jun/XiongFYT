@@ -17,6 +17,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 #######################
 
 find_package(ament_cmake_auto REQUIRED)
+find_package(def_msg REQUIRED)
+
+#xiong：添加 def_msg
 ament_auto_find_build_dependencies()
 
 ###########
@@ -27,10 +30,16 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   DIRECTORY src
 )
 
+#xiong：链接 def_msg
+ament_target_dependencies(${PROJECT_NAME}
+  def_msg
+)
+
 rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN fyt::auto_aim::ArmorSolverNode
   EXECUTABLE ${PROJECT_NAME}_node
 )
+
 
 #############
 ## Testing ##

@@ -1,6 +1,11 @@
-odom2camera:
+odom2camera0:
   xyz: "\"0.10 0.0  0.05\""
   rpy: "\"0.0  0.0  0.0\""
+
+# 后相机外参
+odom2camera1:
+  xyz: "\"-0.10 0.0 0.05\""
+  rpy: "\"0.0 0.0 0.0\""
 
 # 设置启动参数
 # 命名空间 所有节点、话题都会以这个命名空间开头，如/some_namespace/image_raw

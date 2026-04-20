@@ -43,6 +43,8 @@
 #include "rm_interfaces/srv/set_mode.hpp"
 #include "rm_utils/heartbeat.hpp"
 #include "rm_utils/logger/log.hpp"
+#include "def_msg/msg/gimble_control.hpp"
+
 
 namespace fyt::auto_aim {
 using tf2_filter = tf2_ros::MessageFilter<rm_interfaces::msg::Armors>;
@@ -51,7 +53,7 @@ public:
   explicit ArmorSolverNode(const rclcpp::NodeOptions &options);
 
 private:
-  void armorsCallback(const rm_interfaces::msg::Armors::SharedPtr armors_ptr);
+  void armorsCallback(const rm_interfaces::msg::Armors::SharedPtr armors_ptr, ObservationSource source);
 
   void initMarkers() noexcept;
 
@@ -77,6 +79,11 @@ private:
   double lost_time_thres_;
   std::unique_ptr<Tracker> tracker_;
 
+  // 噪声缩放系数
+  double front_r_scale_;
+  double rear_r_scale_;
+  double current_r_scale_;
+
   // Armor Solver
   std::unique_ptr<Solver> solver_;
 
@@ -84,9 +91,16 @@ private:
   std::string target_frame_;
   std::shared_ptr<tf2_ros::Buffer> tf2_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf2_listener_;
-  message_filters::Subscriber<rm_interfaces::msg::Armors> armors_sub_;
+
+// 前相机订阅者
+  message_filters::Subscriber<rm_interfaces::msg::Armors> front_armors_sub_;
+  std::shared_ptr<tf2_filter> front_tf2_filter_;
+
+  // 后相机订阅者
+  message_filters::Subscriber<rm_interfaces::msg::Armors> rear_armors_sub_;
+  std::shared_ptr<tf2_filter> rear_tf2_filter_;
+
   rm_interfaces::msg::Target armor_target_;
-  std::shared_ptr<tf2_filter> tf2_filter_;
 
   // Measurement publisher
   rclcpp::Publisher<rm_interfaces::msg::Measurement>::SharedPtr measure_pub_;
@@ -94,6 +108,7 @@ private:
   // Publisher
   rclcpp::Publisher<rm_interfaces::msg::Target>::SharedPtr target_pub_;
   rclcpp::Publisher<rm_interfaces::msg::GimbalCmd>::SharedPtr gimbal_pub_;
+  rclcpp::Publisher<def_msg::msg::GimbleControl>::SharedPtr vision_gimbal_pub_;
   rclcpp::TimerBase::SharedPtr pub_timer_;
   void timerCallback();
   
@@ -109,6 +124,7 @@ private:
   visualization_msgs::msg::Marker armors_marker_;
   visualization_msgs::msg::Marker selection_marker_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
+
 };
 
 }  // namespace fyt::auto_aim

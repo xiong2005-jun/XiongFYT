@@ -1,21 +1,3 @@
-// Copyright Chen Jun 2023. Licensed under the MIT License.
-//
-// Additional modifications and features by Chengfu Zou, Labor. Licensed under Apache License 2.0.
-//
-// Copyright (C) FYT Vision Group. All rights reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #include "armor_solver/armor_solver_node.hpp"
 
 // std
@@ -89,16 +71,24 @@ ArmorSolverNode::ArmorSolverNode(const rclcpp::NodeOptions &options)
   r_y_ = declare_parameter("ekf.r_y", 0.05);
   r_z_ = declare_parameter("ekf.r_z", 0.05);
   r_yaw_ = declare_parameter("ekf.r_yaw", 0.02);
+
+  // 在构造函数中，EKF 相关部分之前添加
+  front_r_scale_ = this->declare_parameter("ekf.front_r_scale", 1.0);
+  rear_r_scale_  = this->declare_parameter("ekf.rear_r_scale", 4.0);
+  current_r_scale_ = front_r_scale_;
+
+  // 修改 u_r 定义
   auto u_r = [this](const Eigen::Matrix<double, Z_N, 1> &z) {
+    double scale = current_r_scale_;
     Eigen::Matrix<double, Z_N, Z_N> r;
-    // clang-format off
-    r << r_x_ * std::abs(z[0]), 0, 0, 0,
-         0, r_y_ * std::abs(z[1]), 0, 0,
-         0, 0, r_z_ * std::abs(z[2]), 0,
-         0, 0, 0, r_yaw_;
-    // clang-format on
+    r << (r_x_ * scale) * std::abs(z[0]), 0, 0, 0,
+         0, (r_y_ * scale) * std::abs(z[1]), 0, 0,
+         0, 0, (r_z_ * scale) * std::abs(z[2]), 0,
+         0, 0, 0, (r_yaw_ * scale);
     return r;
-  };
+};
+
+
   // P - error estimate covariance matrix
   Eigen::DiagonalMatrix<double, X_N> p0;
   p0.setIdentity();
@@ -114,18 +104,37 @@ ArmorSolverNode::ArmorSolverNode(const rclcpp::NodeOptions &options)
   tf2_buffer_->setCreateTimerInterface(timer_interface);
   tf2_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf2_buffer_);
   // subscriber and filter
-  armors_sub_.subscribe(this, "armor_detector/armors", rmw_qos_profile_sensor_data);
   target_frame_ = this->declare_parameter("target_frame", "odom");
-  tf2_filter_ = std::make_shared<tf2_filter>(armors_sub_,
-                                             *tf2_buffer_,
-                                             target_frame_,
-                                             10,
-                                             this->get_node_logging_interface(),
-                                             this->get_node_clock_interface(),
-                                             std::chrono::duration<int>(1));
-  // Register a callback with tf2_ros::MessageFilter to be called when
-  // transforms are available
-  tf2_filter_->registerCallback(&ArmorSolverNode::armorsCallback, this);
+
+  // 前相机订阅者
+front_armors_sub_.subscribe(this, "/front/armor_detector/armors", rmw_qos_profile_sensor_data);
+front_tf2_filter_ = std::make_shared<tf2_filter>(front_armors_sub_,
+                                                 *tf2_buffer_,
+                                                 target_frame_,
+                                                 10,
+                                                 this->get_node_logging_interface(),
+                                                 this->get_node_clock_interface(),
+                                                 std::chrono::duration<int>(1));
+front_tf2_filter_->registerCallback(
+    [this](rm_interfaces::msg::Armors::ConstSharedPtr msg) {
+        auto non_const_msg = std::const_pointer_cast<rm_interfaces::msg::Armors>(msg);
+        this->armorsCallback(non_const_msg, ObservationSource::FRONT);
+    });
+
+// 后相机订阅者
+rear_armors_sub_.subscribe(this, "/rear/armor_detector/armors", rmw_qos_profile_sensor_data);
+rear_tf2_filter_ = std::make_shared<tf2_filter>(rear_armors_sub_,
+                                                *tf2_buffer_,
+                                                target_frame_,
+                                                10,
+                                                this->get_node_logging_interface(),
+                                                this->get_node_clock_interface(),
+                                                std::chrono::duration<int>(1));
+rear_tf2_filter_->registerCallback(
+    [this](rm_interfaces::msg::Armors::ConstSharedPtr msg) {
+        auto non_const_msg = std::const_pointer_cast<rm_interfaces::msg::Armors>(msg);
+        this->armorsCallback(non_const_msg, ObservationSource::REAR);
+    });
 
   // Measurement publisher (for debug usage)
   measure_pub_ = this->create_publisher<rm_interfaces::msg::Measurement>("armor_solver/measurement",
@@ -136,6 +145,9 @@ ArmorSolverNode::ArmorSolverNode(const rclcpp::NodeOptions &options)
                                                                    rclcpp::SensorDataQoS());
   gimbal_pub_ = this->create_publisher<rm_interfaces::msg::GimbalCmd>("armor_solver/cmd_gimbal",
                                                                       rclcpp::SensorDataQoS());
+  vision_gimbal_pub_ = this->create_publisher<def_msg::msg::GimbleControl>("/vision/gimble_control",
+                                                                     rclcpp::SensorDataQoS());
+
   // Timer 250 Hz
   pub_timer_ = this->create_wall_timer(std::chrono::milliseconds(4),
                                        std::bind(&ArmorSolverNode::timerCallback, this));
@@ -156,6 +168,7 @@ ArmorSolverNode::ArmorSolverNode(const rclcpp::NodeOptions &options)
   heartbeat_ = HeartBeatPublisher::create(this);
 }
 
+/*
 void ArmorSolverNode::timerCallback() {
   if (solver_ == nullptr) {
     return;
@@ -202,6 +215,74 @@ void ArmorSolverNode::timerCallback() {
     publishMarkers(armor_target_, control_msg);
   }
 }
+*/
+void ArmorSolverNode::timerCallback() {
+  if (solver_ == nullptr) {
+    return;
+  }
+
+  if (!enable_) {
+    return;
+  }
+
+  // Init message
+  rm_interfaces::msg::GimbalCmd control_msg;
+
+  // If target never detected
+  if (armor_target_.header.frame_id.empty()) {
+    control_msg.yaw_diff = 0;
+    control_msg.pitch_diff = 0;
+    control_msg.distance = -1;
+    control_msg.pitch = 0;
+    control_msg.yaw = 0;
+    control_msg.fire_advice = false;
+    gimbal_pub_->publish(control_msg);
+
+    // ====================== 直接发 /vision/gimble_control ======================
+    def_msg::msg::GimbleControl vision_msg;
+    vision_msg.header = control_msg.header;
+    vision_msg.yaw = control_msg.yaw;
+    vision_msg.pitch = control_msg.pitch;
+    vision_msg.fire_advise = control_msg.fire_advice ? 1 : 0;
+    vision_gimbal_pub_->publish(vision_msg);
+    // ========================================================================
+
+    return;
+  }
+
+  if (armor_target_.tracking) {
+    try {
+      control_msg = solver_->solve(armor_target_, this->now(), tf2_buffer_);
+    } catch (...) {
+      FYT_ERROR("armor_solver", "Something went wrong in solver!");
+      control_msg.yaw_diff = 0;
+      control_msg.pitch_diff = 0;
+      control_msg.distance = -1;
+      control_msg.fire_advice = false;
+    }
+  } else {
+    control_msg.yaw_diff = 0;
+    control_msg.pitch_diff = 0;
+    control_msg.distance = -1;
+    control_msg.fire_advice = false;
+  }
+
+  gimbal_pub_->publish(control_msg);
+
+  // ====================== 直接发 /vision/gimble_control ======================
+  def_msg::msg::GimbleControl vision_msg;
+  vision_msg.header = control_msg.header;
+  vision_msg.yaw = control_msg.yaw;
+  vision_msg.pitch = control_msg.pitch;
+  vision_msg.fire_advise = control_msg.fire_advice ? 1 : 0;
+  vision_gimbal_pub_->publish(vision_msg);
+  // ========================================================================
+
+  if (debug_mode_) {
+    publishMarkers(armor_target_, control_msg);
+  }
+}
+
 
 void ArmorSolverNode::initMarkers() noexcept {
   // Visualization Marker Publisher
@@ -251,13 +332,21 @@ void ArmorSolverNode::initMarkers() noexcept {
     this->create_publisher<visualization_msgs::msg::MarkerArray>("armor_solver/marker", 10);
 }
 
-void ArmorSolverNode::armorsCallback(const rm_interfaces::msg::Armors::SharedPtr armors_msg) {
-  // Lazy initialize solver owing to weak_from_this() can't be called in constructor
+void ArmorSolverNode::armorsCallback(const rm_interfaces::msg::Armors::SharedPtr armors_msg,
+                                     ObservationSource source) {
+  // Lazy initialize solver
   if (solver_ == nullptr) {
     solver_ = std::make_unique<Solver>(weak_from_this());
   }
 
-  // Tranform armor position from image frame to world coordinate
+  // 根据来源设置当前噪声缩放系数（仅前相机观测会用到）
+  if (source == ObservationSource::FRONT) {
+    current_r_scale_ = front_r_scale_;
+  } else {
+    current_r_scale_ = rear_r_scale_;
+  }
+
+  // 坐标变换到世界坐标系
   for (auto &armor : armors_msg->armors) {
     geometry_msgs::msg::PoseStamped ps;
     ps.header = armors_msg->header;
@@ -270,23 +359,66 @@ void ArmorSolverNode::armorsCallback(const rm_interfaces::msg::Armors::SharedPtr
     }
   }
 
-  // Filter abnormal armors
+  // 滤除异常高度值
   armors_msg->armors.erase(std::remove_if(armors_msg->armors.begin(),
                                           armors_msg->armors.end(),
                                           [](const rm_interfaces::msg::Armor &armor) {
-                                            return abs(armor.pose.position.z) > 2;
+                                            return std::abs(armor.pose.position.z) > 2.0;
                                           }),
                            armors_msg->armors.end());
 
-  // Init message
-  rm_interfaces::msg::Measurement measure_msg;
-  rm_interfaces::msg::Target target_msg;
   rclcpp::Time time = armors_msg->header.stamp;
+  rm_interfaces::msg::Target target_msg;
   target_msg.header.stamp = time;
   target_msg.header.frame_id = target_frame_;
 
+  // ========== 后相机特殊处理（仅 LOST 状态） ==========
+  if (tracker_->tracker_state == Tracker::LOST && source == ObservationSource::REAR) {
+    static bool warned_empty = false;
 
-  // Update tracker
+    if (armors_msg->armors.empty()) {
+      if (!warned_empty) {
+        FYT_WARN("armor_solver", "Rear camera triggered fast track but no armor detected, suppressed future warnings.");
+        warned_empty = true;
+      }
+      return;  // 空消息，不执行任何初始化
+    }
+
+    // 有效检测：重置警告标志，执行快速初始化
+    warned_empty = false;
+    tracker_->init(armors_msg);
+    tracker_->tracker_state = Tracker::TRACKING;
+    FYT_INFO("armor_solver", "Fast track triggered by rear camera, state -> TRACKING");
+
+    const auto &state = tracker_->target_state;
+    target_msg.tracking = true;
+    target_msg.id = tracker_->tracked_id;
+    target_msg.armors_num = static_cast<int>(tracker_->tracked_armors_num);
+    target_msg.position.x = state(0);
+    target_msg.velocity.x = state(1);
+    target_msg.position.y = state(2);
+    target_msg.velocity.y = state(3);
+    target_msg.position.z = state(4);
+    target_msg.velocity.z = state(5);
+    target_msg.yaw = state(6);
+    target_msg.v_yaw = state(7);
+    target_msg.radius_1 = state(8);
+    target_msg.radius_2 = tracker_->another_r;
+    target_msg.d_zc = state(9);
+    target_msg.d_za = tracker_->d_za;
+
+    armor_target_ = target_msg;
+    target_pub_->publish(target_msg);
+    last_time_ = time;
+    return;  // 快速触发完毕，跳过后续通用流程
+  }
+
+  // 如果来源是后相机但状态不是 LOST，直接丢弃观测
+  if (source == ObservationSource::REAR) {
+    return;
+  }
+
+  // ========== 前相机正常跟踪流程（与原单相机逻辑一致） ==========
   if (tracker_->tracker_state == Tracker::LOST) {
     tracker_->init(armors_msg);
     target_msg.tracking = false;
@@ -298,8 +430,10 @@ void ArmorSolverNode::armorsCallback(const rm_interfaces::msg::Armors::SharedPtr
     } else {
       tracker_->ekf->setPredictFunc(Predict{dt_, MotionModel::CONSTANT_VEL_ROT});
     }
-    tracker_->update(armors_msg);
-    // Publish measurement
+    tracker_->update(armors_msg, source);
+
+    // 发布测量值用于调试
+    rm_interfaces::msg::Measurement measure_msg;
     measure_msg.x = tracker_->measurement(0);
     measure_msg.y = tracker_->measurement(1);
     measure_msg.z = tracker_->measurement(2);
@@ -311,7 +445,6 @@ void ArmorSolverNode::armorsCallback(const rm_interfaces::msg::Armors::SharedPtr
     } else if (tracker_->tracker_state == Tracker::TRACKING ||
                tracker_->tracker_state == Tracker::TEMP_LOST) {
       target_msg.tracking = true;
-      // Fill target message
       const auto &state = tracker_->target_state;
       target_msg.id = tracker_->tracked_id;
       target_msg.armors_num = static_cast<int>(tracker_->tracked_armors_num);
@@ -330,10 +463,8 @@ void ArmorSolverNode::armorsCallback(const rm_interfaces::msg::Armors::SharedPtr
     }
   }
 
-  // Store and Publish the target_msg
   armor_target_ = target_msg;
   target_pub_->publish(target_msg);
-
   last_time_ = time;
 }
 
