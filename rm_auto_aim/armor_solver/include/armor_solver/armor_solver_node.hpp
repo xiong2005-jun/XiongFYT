@@ -60,7 +60,6 @@ private:
   void publishMarkers(const rm_interfaces::msg::Target &target_msg,
                       const rm_interfaces::msg::GimbalCmd &gimbal_cmd) noexcept;
 
-
   void setModeCallback(const std::shared_ptr<rm_interfaces::srv::SetMode::Request> request,
                        std::shared_ptr<rm_interfaces::srv::SetMode::Response> response);
   
@@ -83,6 +82,9 @@ private:
   double front_r_scale_;
   double rear_r_scale_;
   double current_r_scale_;
+
+  // 保护 Tracker / EKF 状态
+  std::mutex ekf_mutex_;   
 
   // Armor Solver
   std::unique_ptr<Solver> solver_;

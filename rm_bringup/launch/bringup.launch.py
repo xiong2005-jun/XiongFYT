@@ -11,6 +11,8 @@ def generate_launch_description():
     from launch_ros.actions import Node, PushRosNamespace
     from launch.actions import TimerAction
     from launch import LaunchDescription
+    from launch_ros.descriptions import ComposableNode
+    from launch_ros.actions import ComposableNodeContainer
 
     launch_params = yaml.safe_load(open(os.path.join(
         get_package_share_directory('rm_bringup'), 'config', 'launch_params.yaml')))
@@ -83,10 +85,11 @@ def generate_launch_description():
             ('armor_detector/armors', '/rear/armor_detector/armors')
         ]
     )
-    
-    # 装甲板解算节点
+
+    # 装甲板解算节点（多线程容器）
     if launch_params['hero_solver']:
-        armor_solver_node = Node(
+        # 如果使用英雄解算（普通节点），保持原样
+        armor_solver_container = Node(
             package='hero_armor_solver',
             executable='hero_armor_solver_node',
             name='armor_solver',
@@ -94,18 +97,28 @@ def generate_launch_description():
             parameters=[get_params('armor_solver')]
         )
     else:
-        armor_solver_node = Node(
+        # 使用标准解算，放入多线程容器以获得并行处理能力
+        armor_solver_composable = ComposableNode(
             package='armor_solver',
-            executable='armor_solver_node',
+            plugin='fyt::auto_aim::ArmorSolverNode',
             name='armor_solver',
+            parameters=[get_params('armor_solver')],
+            extra_arguments=[{'use_intra_process_comms': True}]
+        )
+        armor_solver_container = ComposableNodeContainer(
+            name='solver_container',
+            namespace='',
+            package='rclcpp_components',
+            executable='component_container_mt',   # 多线程执行器
+            composable_node_descriptions=[armor_solver_composable],
             output='both',
-            parameters=[get_params('armor_solver')]
+            emulate_tty=True
         )
 
     # 延迟启动，确保 TF 发布器先就绪
     delay_front_detector = TimerAction(period=2.0, actions=[front_detector_node])
     delay_rear_detector = TimerAction(period=2.5, actions=[rear_detector_node])
-    delay_armor_solver_node = TimerAction(period=3.0, actions=[armor_solver_node])
+    delay_solver = TimerAction(period=3.0, actions=[armor_solver_container])
 
     push_namespace = PushRosNamespace(launch_params['namespace'])
     
@@ -115,7 +128,7 @@ def generate_launch_description():
         push_namespace,
         delay_front_detector,
         delay_rear_detector,
-        delay_armor_solver_node
+        delay_solver
     ]
     
     # 如果启用导航，添加导航 TF 发布器

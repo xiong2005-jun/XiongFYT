@@ -11,10 +11,10 @@
       sigma2_q_yaw: 1.0
       sigma2_q_r: 80.0
 
-      r_x: 4e-4
-      r_y: 4e-4
-      r_z: 9e-4
-      r_yaw: 5e-3
+      r_x: 0.0004
+      r_y: 0.0004
+      r_z: 0.0009
+      r_yaw: 0.005
 
       front_r_scale: 1.0
       rear_r_scale: 1.0

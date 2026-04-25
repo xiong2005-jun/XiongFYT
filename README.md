@@ -1,6 +1,7 @@
 本项目基于中南FYT二次修改
 双相机自瞄，增加了后相机，减小了视野盲区。
 启动方式
+source install/setup.bash
 1. 启动双相机包
 ros2 launch hik_camera hik_camera.launch.py
 2. 启动串口包

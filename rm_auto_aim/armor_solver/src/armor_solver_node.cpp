@@ -168,55 +168,198 @@ rear_tf2_filter_->registerCallback(
   heartbeat_ = HeartBeatPublisher::create(this);
 }
 
-/*
-void ArmorSolverNode::timerCallback() {
-  if (solver_ == nullptr) {
-    return;
-  }
+void ArmorSolverNode::initMarkers() noexcept {
+  // Visualization Marker Publisher
+  // See http://wiki.ros.org/rviz/DisplayTypes/Marker
+  position_marker_.ns = "position";
+  position_marker_.type = visualization_msgs::msg::Marker::SPHERE;
+  position_marker_.scale.x = position_marker_.scale.y = position_marker_.scale.z = 0.1;
+  position_marker_.color.a = 1.0;
+  position_marker_.color.g = 1.0;
+  linear_v_marker_.type = visualization_msgs::msg::Marker::ARROW;
+  linear_v_marker_.ns = "linear_v";
+  linear_v_marker_.scale.x = 0.03;
+  linear_v_marker_.scale.y = 0.05;
+  linear_v_marker_.color.a = 1.0;
+  linear_v_marker_.color.r = 1.0;
+  linear_v_marker_.color.g = 1.0;
+  angular_v_marker_.type = visualization_msgs::msg::Marker::ARROW;
+  angular_v_marker_.ns = "angular_v";
+  angular_v_marker_.scale.x = 0.03;
+  angular_v_marker_.scale.y = 0.05;
+  angular_v_marker_.color.a = 1.0;
+  angular_v_marker_.color.b = 1.0;
+  angular_v_marker_.color.g = 1.0;
+  armors_marker_.ns = "filtered_armors";
+  armors_marker_.type = visualization_msgs::msg::Marker::CUBE;
+  armors_marker_.scale.x = 0.03;
+  armors_marker_.scale.z = 0.125;
+  armors_marker_.color.a = 1.0;
+  armors_marker_.color.b = 1.0;
+  selection_marker_.ns = "selection";
+  selection_marker_.type = visualization_msgs::msg::Marker::SPHERE;
+  selection_marker_.scale.x = selection_marker_.scale.y = selection_marker_.scale.z = 0.1;
+  selection_marker_.color.a = 1.0;
+  selection_marker_.color.g = 1.0;
+  selection_marker_.color.r = 1.0;
+  trajectory_marker_.ns = "trajectory";
+  trajectory_marker_.type = visualization_msgs::msg::Marker::POINTS;
+  trajectory_marker_.scale.x = 0.01;
+  trajectory_marker_.scale.y = 0.01;
+  trajectory_marker_.color.a = 1.0;
+  trajectory_marker_.color.r = 1.0;
+  trajectory_marker_.color.g = 0.75;
+  trajectory_marker_.color.b = 0.79;
+  trajectory_marker_.points.clear();
 
-  if (!enable_) {
-    return;
-  }
-
-  // Init message
-  rm_interfaces::msg::GimbalCmd control_msg;
-
-  // If target never detected
-  if (armor_target_.header.frame_id.empty()) {
-    control_msg.yaw_diff = 0;
-    control_msg.pitch_diff = 0;
-    control_msg.distance = -1;
-    control_msg.pitch = 0;
-    control_msg.yaw = 0;
-    control_msg.fire_advice = false;
-    gimbal_pub_->publish(control_msg);
-    return;
-  }
-
-  if (armor_target_.tracking) {
-    try {
-      control_msg = solver_->solve(armor_target_, this->now(), tf2_buffer_);
-    } catch (...) {
-      FYT_ERROR("armor_solver", "Something went wrong in solver!");
-      control_msg.yaw_diff = 0;
-      control_msg.pitch_diff = 0;
-      control_msg.distance = -1;
-      control_msg.fire_advice = false;
-    }
-  } else {
-    control_msg.yaw_diff = 0;
-    control_msg.pitch_diff = 0;
-    control_msg.distance = -1;
-    control_msg.fire_advice = false;
-  }
-  gimbal_pub_->publish(control_msg);
-
-  if (debug_mode_) {
-    publishMarkers(armor_target_, control_msg);
-  }
+  marker_pub_ =
+    this->create_publisher<visualization_msgs::msg::MarkerArray>("armor_solver/marker", 10);
 }
-*/
+
+void ArmorSolverNode::armorsCallback(const rm_interfaces::msg::Armors::SharedPtr armors_msg,
+                                     ObservationSource source) {
+  // Lazy initialize solver (不需要锁，solver_ 只在首次构造后不变)
+  if (solver_ == nullptr) {
+    solver_ = std::make_unique<Solver>(weak_from_this());
+  }
+
+  // 噪声缩放系数（线程安全：current_r_scale_ 是原子？这里它是普通变量，但仅在本线程设置，其他线程只读？在多线程下同时读写可能不安全，但该变量只在 armorsCallback 中写，timerCallback 中不用，所以没问题）
+  if (source == ObservationSource::FRONT) {
+    current_r_scale_ = front_r_scale_;
+  } else {
+    current_r_scale_ = rear_r_scale_;
+  }
+
+  // 坐标变换到世界坐标系（不涉及共享状态，无需加锁）
+  for (auto &armor : armors_msg->armors) {
+    geometry_msgs::msg::PoseStamped ps;
+    ps.header = armors_msg->header;
+    ps.pose = armor.pose;
+    try {
+      armor.pose = tf2_buffer_->transform(ps, target_frame_).pose;
+    } catch (const tf2::TransformException &ex) {
+      FYT_ERROR("armor_solver", "Transform error: {}", ex.what());
+      return;
+    }
+  }
+
+  // 滤除异常高度值
+  armors_msg->armors.erase(std::remove_if(armors_msg->armors.begin(),
+                                          armors_msg->armors.end(),
+                                          [](const rm_interfaces::msg::Armor &armor) {
+                                            return std::abs(armor.pose.position.z) > 2.0;
+                                          }),
+                           armors_msg->armors.end());
+
+  rclcpp::Time time = armors_msg->header.stamp;
+  rm_interfaces::msg::Target target_msg;
+  target_msg.header.stamp = time;
+  target_msg.header.frame_id = target_frame_;
+
+  // ========== 加锁保护共享资源 ==========
+  {
+    std::lock_guard<std::mutex> lock(ekf_mutex_);
+
+    // ========== 后相机特殊处理（仅 LOST 状态） ==========
+    if (tracker_->tracker_state == Tracker::LOST && source == ObservationSource::REAR) {
+      static bool warned_empty = false;
+
+      if (armors_msg->armors.empty()) {
+        if (!warned_empty) {
+          FYT_WARN("armor_solver", "Rear camera triggered fast track but no armor detected, suppressed future warnings.");
+          warned_empty = true;
+        }
+        return;  // 空消息，不执行任何初始化
+      }
+
+      // 有效检测：重置警告标志，执行快速初始化
+      warned_empty = false;
+      tracker_->init(armors_msg);
+      tracker_->tracker_state = Tracker::TRACKING;
+      FYT_INFO("armor_solver", "Fast track triggered by rear camera, state -> TRACKING");
+
+      const auto &state = tracker_->target_state;
+      target_msg.tracking = true;
+      target_msg.id = tracker_->tracked_id;
+      target_msg.armors_num = static_cast<int>(tracker_->tracked_armors_num);
+      target_msg.position.x = state(0);
+      target_msg.velocity.x = state(1);
+      target_msg.position.y = state(2);
+      target_msg.velocity.y = state(3);
+      target_msg.position.z = state(4);
+      target_msg.velocity.z = state(5);
+      target_msg.yaw = state(6);
+      target_msg.v_yaw = state(7);
+      target_msg.radius_1 = state(8);
+      target_msg.radius_2 = tracker_->another_r;
+      target_msg.d_zc = state(9);
+      target_msg.d_za = tracker_->d_za;
+
+      armor_target_ = target_msg;
+      target_pub_->publish(target_msg);
+      last_time_ = time;
+      return;  // 快速触发完毕，跳过后续通用流程
+    }
+
+    // 如果来源是后相机但状态不是 LOST，直接丢弃观测
+    if (source == ObservationSource::REAR) {
+      return;
+    }
+
+    // ========== 前相机正常跟踪流程（与原单相机逻辑一致） ==========
+    if (tracker_->tracker_state == Tracker::LOST) {
+      tracker_->init(armors_msg);
+      target_msg.tracking = false;
+    } else {
+      dt_ = (time - last_time_).seconds();
+      tracker_->lost_thres = std::abs(static_cast<int>(lost_time_thres_ / dt_));
+      if (tracker_->tracked_id == "outpost") {
+        tracker_->ekf->setPredictFunc(Predict{dt_, MotionModel::CONSTANT_ROTATION});
+      } else {
+        tracker_->ekf->setPredictFunc(Predict{dt_, MotionModel::CONSTANT_VEL_ROT});
+      }
+      tracker_->update(armors_msg, source);
+
+      // 发布测量值用于调试
+      rm_interfaces::msg::Measurement measure_msg;
+      measure_msg.x = tracker_->measurement(0);
+      measure_msg.y = tracker_->measurement(1);
+      measure_msg.z = tracker_->measurement(2);
+      measure_msg.yaw = tracker_->measurement(3);
+      measure_pub_->publish(measure_msg);
+
+      if (tracker_->tracker_state == Tracker::DETECTING) {
+        target_msg.tracking = false;
+      } else if (tracker_->tracker_state == Tracker::TRACKING ||
+                 tracker_->tracker_state == Tracker::TEMP_LOST) {
+        target_msg.tracking = true;
+        const auto &state = tracker_->target_state;
+        target_msg.id = tracker_->tracked_id;
+        target_msg.armors_num = static_cast<int>(tracker_->tracked_armors_num);
+        target_msg.position.x = state(0);
+        target_msg.velocity.x = state(1);
+        target_msg.position.y = state(2);
+        target_msg.velocity.y = state(3);
+        target_msg.position.z = state(4);
+        target_msg.velocity.z = state(5);
+        target_msg.yaw = state(6);
+        target_msg.v_yaw = state(7);
+        target_msg.radius_1 = state(8);
+        target_msg.radius_2 = tracker_->another_r;
+        target_msg.d_zc = state(9);
+        target_msg.d_za = tracker_->d_za;
+      }
+    }
+
+    armor_target_ = target_msg;
+    target_pub_->publish(target_msg);
+    last_time_ = time;
+  } // 锁释放
+}
+
 void ArmorSolverNode::timerCallback() {
+  std::lock_guard<std::mutex> lock(ekf_mutex_);
+
   if (solver_ == nullptr) {
     return;
   }
@@ -283,190 +426,6 @@ void ArmorSolverNode::timerCallback() {
   }
 }
 
-
-void ArmorSolverNode::initMarkers() noexcept {
-  // Visualization Marker Publisher
-  // See http://wiki.ros.org/rviz/DisplayTypes/Marker
-  position_marker_.ns = "position";
-  position_marker_.type = visualization_msgs::msg::Marker::SPHERE;
-  position_marker_.scale.x = position_marker_.scale.y = position_marker_.scale.z = 0.1;
-  position_marker_.color.a = 1.0;
-  position_marker_.color.g = 1.0;
-  linear_v_marker_.type = visualization_msgs::msg::Marker::ARROW;
-  linear_v_marker_.ns = "linear_v";
-  linear_v_marker_.scale.x = 0.03;
-  linear_v_marker_.scale.y = 0.05;
-  linear_v_marker_.color.a = 1.0;
-  linear_v_marker_.color.r = 1.0;
-  linear_v_marker_.color.g = 1.0;
-  angular_v_marker_.type = visualization_msgs::msg::Marker::ARROW;
-  angular_v_marker_.ns = "angular_v";
-  angular_v_marker_.scale.x = 0.03;
-  angular_v_marker_.scale.y = 0.05;
-  angular_v_marker_.color.a = 1.0;
-  angular_v_marker_.color.b = 1.0;
-  angular_v_marker_.color.g = 1.0;
-  armors_marker_.ns = "filtered_armors";
-  armors_marker_.type = visualization_msgs::msg::Marker::CUBE;
-  armors_marker_.scale.x = 0.03;
-  armors_marker_.scale.z = 0.125;
-  armors_marker_.color.a = 1.0;
-  armors_marker_.color.b = 1.0;
-  selection_marker_.ns = "selection";
-  selection_marker_.type = visualization_msgs::msg::Marker::SPHERE;
-  selection_marker_.scale.x = selection_marker_.scale.y = selection_marker_.scale.z = 0.1;
-  selection_marker_.color.a = 1.0;
-  selection_marker_.color.g = 1.0;
-  selection_marker_.color.r = 1.0;
-  trajectory_marker_.ns = "trajectory";
-  trajectory_marker_.type = visualization_msgs::msg::Marker::POINTS;
-  trajectory_marker_.scale.x = 0.01;
-  trajectory_marker_.scale.y = 0.01;
-  trajectory_marker_.color.a = 1.0;
-  trajectory_marker_.color.r = 1.0;
-  trajectory_marker_.color.g = 0.75;
-  trajectory_marker_.color.b = 0.79;
-  trajectory_marker_.points.clear();
-
-  marker_pub_ =
-    this->create_publisher<visualization_msgs::msg::MarkerArray>("armor_solver/marker", 10);
-}
-
-void ArmorSolverNode::armorsCallback(const rm_interfaces::msg::Armors::SharedPtr armors_msg,
-                                     ObservationSource source) {
-  // Lazy initialize solver
-  if (solver_ == nullptr) {
-    solver_ = std::make_unique<Solver>(weak_from_this());
-  }
-
-  // 根据来源设置当前噪声缩放系数（仅前相机观测会用到）
-  if (source == ObservationSource::FRONT) {
-    current_r_scale_ = front_r_scale_;
-  } else {
-    current_r_scale_ = rear_r_scale_;
-  }
-
-  // 坐标变换到世界坐标系
-  for (auto &armor : armors_msg->armors) {
-    geometry_msgs::msg::PoseStamped ps;
-    ps.header = armors_msg->header;
-    ps.pose = armor.pose;
-    try {
-      armor.pose = tf2_buffer_->transform(ps, target_frame_).pose;
-    } catch (const tf2::TransformException &ex) {
-      FYT_ERROR("armor_solver", "Transform error: {}", ex.what());
-      return;
-    }
-  }
-
-  // 滤除异常高度值
-  armors_msg->armors.erase(std::remove_if(armors_msg->armors.begin(),
-                                          armors_msg->armors.end(),
-                                          [](const rm_interfaces::msg::Armor &armor) {
-                                            return std::abs(armor.pose.position.z) > 2.0;
-                                          }),
-                           armors_msg->armors.end());
-
-  rclcpp::Time time = armors_msg->header.stamp;
-  rm_interfaces::msg::Target target_msg;
-  target_msg.header.stamp = time;
-  target_msg.header.frame_id = target_frame_;
-
-  // ========== 后相机特殊处理（仅 LOST 状态） ==========
-  if (tracker_->tracker_state == Tracker::LOST && source == ObservationSource::REAR) {
-    static bool warned_empty = false;
-
-    if (armors_msg->armors.empty()) {
-      if (!warned_empty) {
-        FYT_WARN("armor_solver", "Rear camera triggered fast track but no armor detected, suppressed future warnings.");
-        warned_empty = true;
-      }
-      return;  // 空消息，不执行任何初始化
-    }
-
-    // 有效检测：重置警告标志，执行快速初始化
-    warned_empty = false;
-    tracker_->init(armors_msg);
-    tracker_->tracker_state = Tracker::TRACKING;
-    FYT_INFO("armor_solver", "Fast track triggered by rear camera, state -> TRACKING");
-
-    const auto &state = tracker_->target_state;
-    target_msg.tracking = true;
-    target_msg.id = tracker_->tracked_id;
-    target_msg.armors_num = static_cast<int>(tracker_->tracked_armors_num);
-    target_msg.position.x = state(0);
-    target_msg.velocity.x = state(1);
-    target_msg.position.y = state(2);
-    target_msg.velocity.y = state(3);
-    target_msg.position.z = state(4);
-    target_msg.velocity.z = state(5);
-    target_msg.yaw = state(6);
-    target_msg.v_yaw = state(7);
-    target_msg.radius_1 = state(8);
-    target_msg.radius_2 = tracker_->another_r;
-    target_msg.d_zc = state(9);
-    target_msg.d_za = tracker_->d_za;
-
-    armor_target_ = target_msg;
-    target_pub_->publish(target_msg);
-    last_time_ = time;
-    return;  // 快速触发完毕，跳过后续通用流程
-  }
-
-  // 如果来源是后相机但状态不是 LOST，直接丢弃观测
-  if (source == ObservationSource::REAR) {
-    return;
-  }
-
-  // ========== 前相机正常跟踪流程（与原单相机逻辑一致） ==========
-  if (tracker_->tracker_state == Tracker::LOST) {
-    tracker_->init(armors_msg);
-    target_msg.tracking = false;
-  } else {
-    dt_ = (time - last_time_).seconds();
-    tracker_->lost_thres = std::abs(static_cast<int>(lost_time_thres_ / dt_));
-    if (tracker_->tracked_id == "outpost") {
-      tracker_->ekf->setPredictFunc(Predict{dt_, MotionModel::CONSTANT_ROTATION});
-    } else {
-      tracker_->ekf->setPredictFunc(Predict{dt_, MotionModel::CONSTANT_VEL_ROT});
-    }
-    tracker_->update(armors_msg, source);
-
-    // 发布测量值用于调试
-    rm_interfaces::msg::Measurement measure_msg;
-    measure_msg.x = tracker_->measurement(0);
-    measure_msg.y = tracker_->measurement(1);
-    measure_msg.z = tracker_->measurement(2);
-    measure_msg.yaw = tracker_->measurement(3);
-    measure_pub_->publish(measure_msg);
-
-    if (tracker_->tracker_state == Tracker::DETECTING) {
-      target_msg.tracking = false;
-    } else if (tracker_->tracker_state == Tracker::TRACKING ||
-               tracker_->tracker_state == Tracker::TEMP_LOST) {
-      target_msg.tracking = true;
-      const auto &state = tracker_->target_state;
-      target_msg.id = tracker_->tracked_id;
-      target_msg.armors_num = static_cast<int>(tracker_->tracked_armors_num);
-      target_msg.position.x = state(0);
-      target_msg.velocity.x = state(1);
-      target_msg.position.y = state(2);
-      target_msg.velocity.y = state(3);
-      target_msg.position.z = state(4);
-      target_msg.velocity.z = state(5);
-      target_msg.yaw = state(6);
-      target_msg.v_yaw = state(7);
-      target_msg.radius_1 = state(8);
-      target_msg.radius_2 = tracker_->another_r;
-      target_msg.d_zc = state(9);
-      target_msg.d_za = tracker_->d_za;
-    }
-  }
-
-  armor_target_ = target_msg;
-  target_pub_->publish(target_msg);
-  last_time_ = time;
-}
 
 void ArmorSolverNode::publishMarkers(const rm_interfaces::msg::Target &target_msg,
                                      const rm_interfaces::msg::GimbalCmd &gimbal_cmd) noexcept {
@@ -576,6 +535,7 @@ void ArmorSolverNode::publishMarkers(const rm_interfaces::msg::Target &target_ms
   marker_array.markers.emplace_back(selection_marker_);
   marker_pub_->publish(marker_array);
 }
+
 
 void ArmorSolverNode::setModeCallback(
   const std::shared_ptr<rm_interfaces::srv::SetMode::Request> request,
